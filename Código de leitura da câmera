@@ -1,0 +1,117 @@
+import torch
+import torch.nn as nn
+from torchvision import transforms, models
+import cv2
+from PIL import Image
+import numpy as np
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES DO PROJETO (Manter consistente com train_classifier.py)
+# ==============================================================================
+MODEL_PATH = 'best_luva_classifier.pth' # Seu modelo treinado
+IMAGE_SIZE = 224 
+NUM_CLASSES = 2
+CLASSES = ['com_defeito', 'sem_defeito']
+device = torch.device("cpu") # Usaremos CPU para estabilidade na captura de vídeo
+
+# O índice '0' geralmente se refere à webcam padrão
+CAMERA_INDEX = 0
+
+# ==============================================================================
+# 2. PRÉ-PROCESSAMENTO (O mesmo pipeline de validação/teste)
+# ==============================================================================
+val_test_transforms = transforms.Compose([
+    transforms.Resize(IMAGE_SIZE),
+    transforms.CenterCrop(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# ==============================================================================
+# 3. FUNÇÃO DE INFERÊNCIA NO QUADRO (Frame)
+# ==============================================================================
+def classify_frame(model, frame, transform):
+    # 1. Converte o frame OpenCV (BGR) para o formato PIL (RGB) para o PyTorch
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(frame_rgb)
+    
+    # 2. Aplica as transformações
+    input_tensor = transform(pil_image)
+    
+    # 3. Adiciona uma dimensão para o batch (B, C, H, W) e move para o dispositivo
+    input_batch = input_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        model.eval() # Coloca o modelo em modo de avaliação
+        output = model(input_batch)
+        
+        # 4. Processamento da Saída
+        probabilities = torch.nn.functional.softmax(output[0], dim=0)
+        confidence, predicted_index = torch.max(probabilities, 0)
+
+        predicted_class = CLASSES[predicted_index.item()]
+        
+        # 5. Lógica de Decisão (Aprovar/Reprovar)
+        # O F1-score e a Acurácia foram altos, então usaremos o índice 1 ('sem_defeito') como aprovação
+        if predicted_class == 'sem_defeito' and confidence.item() > 0.8: # Threshold de 80%
+            decision = "✅ APROVADA"
+            color = (0, 255, 0)  # Verde
+        else:
+            decision = "❌ REPROVADA"
+            color = (0, 0, 255)  # Vermelho
+            
+        return predicted_class, confidence.item(), decision, color
+
+# ==============================================================================
+# 4. LOOP PRINCIPAL DE VÍDEO
+# ==============================================================================
+def main():
+    print("Iniciando o sistema de inspeção de qualidade em tempo real...")
+    
+    # 1. Carregar Modelo
+    model_ft = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, NUM_CLASSES)
+    model_ft.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+    model_ft = model_ft.to(device)
+    model_ft.eval()
+    print(f"Modelo '{MODEL_PATH}' carregado com sucesso.")
+
+    # 2. Iniciar Captura de Vídeo
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    if not cap.isOpened():
+        print(f"ERRO: Não foi possível abrir a câmera no índice {CAMERA_INDEX}. Verifique se a câmera está conectada.")
+        return
+
+    print("\nIniciando feed da câmera. Pressione 'q' para sair.")
+    
+    while True:
+        # 3. Captura o frame
+        ret, frame = cap.read()
+        if not ret:
+            print("Não foi possível receber o frame. Saindo...")
+            break
+
+        # 4. Classifica o frame
+        pred_class, confidence, decision, color = classify_frame(model_ft, frame, val_test_transforms)
+        
+        # 5. Adiciona o texto de resultado ao frame (OpenCV usa BGR)
+        text_prediction = f"Classe: {pred_class.upper()} (Conf: {confidence:.2f})"
+        text_decision = f"DECISAO: {decision}"
+        
+        cv2.putText(frame, text_prediction, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, text_decision, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3, cv2.LINE_AA)
+        
+        # 6. Exibe o frame
+        cv2.imshow('Inspeção de Qualidade em Tempo Real', frame)
+
+        # 7. Sai do loop se a tecla 'q' for pressionada
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # 8. Limpeza
+    cap.release()
+    cv2.destroyAllWindows()
+
+if _name_ == '_main_':
+    main()
