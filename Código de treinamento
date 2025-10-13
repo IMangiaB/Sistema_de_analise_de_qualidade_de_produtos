@@ -1,0 +1,292 @@
+# train_classifier.py
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import transforms, models, datasets
+import os
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+import time
+from PIL import Image 
+
+# ==============================================================================
+# 1. PRÉ-PROCESSAMENTO DOS DADOS (Etapa 3.3)
+# ==============================================================================
+
+# Definição dos parâmetros do projeto
+# ATENÇÃO: Verifique a letra da sua unidade (G:) e o caminho.
+PROJECT_ROOT = r'C:\pytorch_luva_projeto'
+DATA_DIR = os.path.join(PROJECT_ROOT, 'data') 
+NUM_CLASSES = 2 
+IMAGE_SIZE = 224 # Tamanho esperado pela ResNet
+BATCH_SIZE = 8
+NUM_EPOCHS = 3 # Reduzido para testar o pipeline rapidamente
+LEARNING_RATE = 0.001
+
+# Configuração do dispositivo (GPU ou CPU)
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+print(f"Dispositivo de execução: {device}")
+
+# 1.1. Transformações de Imagem (Data Augmentation e Normalização)
+train_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(IMAGE_SIZE),
+    transforms.RandomRotation(15), 
+    transforms.RandomHorizontalFlip(), 
+    transforms.ColorJitter(brightness=0.1, contrast=0.1), 
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]) 
+])
+
+# Transformações para Validação e Teste (sem Data Augmentation)
+val_test_transforms = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(IMAGE_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+])
+
+# 1.2. Carregamento dos Dados
+try:
+    image_datasets = {
+        x: datasets.ImageFolder(os.path.join(DATA_DIR, x), 
+                                train_transforms if x == 'train' else val_test_transforms)
+        for x in ['train', 'val', 'test']
+    }
+
+    dataloaders = {
+        x: DataLoader(image_datasets[x], batch_size=BATCH_SIZE, shuffle=True, num_workers=0) # num_workers=0 para Windows e evitar erros
+        for x in ['train', 'val', 'test']
+    }
+    dataset_sizes = {x: len(image_datasets[x]) for x in ['train', 'val', 'test']}
+    class_names = image_datasets['train'].classes # Deve ser ['com_defeito', 'sem_defeito']
+
+    print(f"Classes: {class_names}")
+    print(f"Tamanhos dos datasets: Treinamento={dataset_sizes['train']}, Validação={dataset_sizes['val']}, Teste={dataset_sizes['test']}")
+
+except Exception as e:
+    print(f"\n[ERRO FATAL] Falha ao carregar os dados. Verifique o caminho DATA_DIR e a estrutura de pastas:\n{e}")
+    exit()
+
+# ==============================================================================
+# 2. DESENVOLVIMENTO DO MODELO (Etapa 3.4 - Transferência de Aprendizado)
+# ==============================================================================
+
+def setup_model():
+    """
+    Configura a Rede Neural Convolucional (CNN) ResNet18.
+    """
+    model_ft = models.resnet18(weights='IMAGENET1K_V1')
+    
+    # Congela os pesos de todas as camadas
+    for param in model_ft.parameters():
+        param.requires_grad = False
+
+    # Substitui a última camada para 2 classes
+    num_ftrs = model_ft.fc.in_features
+    model_ft.fc = nn.Linear(num_ftrs, NUM_CLASSES) 
+
+    model_ft = model_ft.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer_ft = optim.Adam(model_ft.fc.parameters(), lr=LEARNING_RATE) 
+    
+    return model_ft, criterion, optimizer_ft
+
+model, criterion, optimizer = setup_model()
+
+
+# ==============================================================================
+# 3. TREINAMENTO E VALIDAÇÃO (Etapa 3.5)
+# ==============================================================================
+
+def train_and_validate_model(model, criterion, optimizer, num_epochs):
+    """
+    Realiza o treinamento e a validação, salvando o melhor modelo.
+    """
+    since = time.time()
+    best_acc = 0.0
+
+    for epoch in range(num_epochs):
+        print(f'\nEpoch {epoch+1}/{num_epochs}')
+        print('-' * 20)
+
+        for phase in ['train', 'val']:
+            if phase == 'train':
+                model.train() 
+            else:
+                model.eval() 
+
+            running_loss = 0.0
+            running_corrects = 0
+
+            for inputs, labels in dataloaders[phase]:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+
+                optimizer.zero_grad()
+
+                with torch.set_grad_enabled(phase == 'train'):
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                    loss = criterion(outputs, labels)
+
+                    if phase == 'train':
+                        loss.backward()
+                        optimizer.step()
+
+                running_loss += loss.item() * inputs.size(0)
+                running_corrects += torch.sum(preds == labels.data)
+
+            epoch_loss = running_loss / dataset_sizes[phase]
+            epoch_acc = running_corrects.double() / dataset_sizes[phase]
+
+            print(f'{phase} Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
+
+            # Salva o melhor modelo
+            if phase == 'val' and epoch_acc > best_acc:
+                best_acc = epoch_acc
+                torch.save(model.state_dict(), 'best_luva_classifier.pth')
+                print(">>> Melhor modelo salvo! <<<")
+
+    time_elapsed = time.time() - since
+    print(f'\nTreinamento concluído em {time_elapsed // 60:.0f}m {time_elapsed % 60:.0f}s')
+    print(f'Melhor Acurácia de Validação: {best_acc:.4f}')
+    return model
+
+# ==============================================================================
+# 4. AVALIAÇÃO DE DESEMPENHO (Etapa 3.6)
+# ==============================================================================
+
+def evaluate_model(model, criterion):
+    """
+    Calcula as métricas de desempenho no conjunto de TESTE.
+    """
+    model.eval()
+    y_true = []
+    y_pred = []
+    
+    test_loss = 0.0
+    
+    with torch.no_grad():
+        for inputs, labels in dataloaders['test']:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+            loss = criterion(outputs, labels)
+
+            test_loss += loss.item() * inputs.size(0)
+
+            y_true.extend(labels.cpu().numpy())
+            y_pred.extend(preds.cpu().numpy())
+
+    # Cálculo da Loss e Acurácia
+    final_loss = test_loss / dataset_sizes['test']
+    accuracy = accuracy_score(y_true, y_pred)
+    
+    # IMPORTANTE: pos_label=0 (se 'com_defeito' for a primeira pasta)
+    precision = precision_score(y_true, y_pred, pos_label=0, average='binary', zero_division=0) 
+    recall = recall_score(y_true, y_pred, pos_label=0, average='binary', zero_division=0)
+    f1 = f1_score(y_true, y_pred, pos_label=0, average='binary', zero_division=0)
+    conf_matrix = confusion_matrix(y_true, y_pred)
+
+    print('\n' + '='*50)
+    print('AVALIAÇÃO DE DESEMPENHO NO CONJUNTO DE TESTE (Etapa 3.6)')
+    print('='*50)
+    print(f'Test Loss: {final_loss:.4f}')
+    print(f'Acurácia: {accuracy:.4f}')
+    print(f'Precisão: {precision:.4f}')
+    print(f'Revocação (Recall): {recall:.4f}')
+    print(f'F1-Score: {f1:.4f}')
+    print('\nMatriz de Confusão (True vs Predição):')
+    print(f"[ [Verdadeiro Negativo, Falso Positivo],")
+    print(f"  [Falso Negativo, Verdadeiro Positivo] ]")
+    print(conf_matrix)
+    print('='*50)
+
+    return model
+
+# ==============================================================================
+# 5. IMPLEMENTAÇÃO DO PROTÓTIPO (Etapa 3.7) - FUNÇÃO
+# ==============================================================================
+
+def run_inference(model, image_path, transform):
+    """
+    Carrega uma única imagem e emite a decisão de "aprovado" ou "reprovado".
+    """
+    print('\n' + '='*50)
+    print(f'PROTÓTIPO EM AÇÃO (Etapa 3.7): Analisando "{os.path.basename(image_path)}"')
+    print('='*50)
+
+    # 1. Carregar e Transformar a Imagem
+    try:
+        image = Image.open(image_path).convert('RGB')
+    except FileNotFoundError:
+        print(f"[ERRO] Imagem de inferência não encontrada em: {image_path}")
+        return
+
+    # Aplica as mesmas transformações de validação/teste
+    input_tensor = transform(image)
+    input_batch = input_tensor.unsqueeze(0).to(device)
+
+    # 2. Executar a Inferência
+    model.eval()
+    with torch.no_grad():
+        output = model(input_batch)
+
+    # 3. Processar o Resultado
+    _, predicted_class_index = torch.max(output, 1)
+    prediction = class_names[predicted_class_index.item()]
+    
+    # Confiança (probabilidade)
+    probabilities = torch.nn.functional.softmax(output, dim=1)[0]
+    confidence = probabilities[predicted_class_index.item()].item()
+    
+    # 4. Emitir Decisão
+    print(f"PREVISÃO DO SISTEMA: {prediction.upper()}")
+    print(f"CONFIANÇA: {confidence:.4f}")
+    
+    if prediction == 'sem_defeito':
+        print("\nDECISÃO FINAL: ✅ APROVADA")
+    else:
+        print("\nDECISÃO FINAL: ❌ REPROVADA")
+    
+    print('='*50)
+
+
+# ==============================================================================
+# 6. EXECUÇÃO PRINCIPAL DO PIPELINE (Fluxo de Controle)
+# ==============================================================================
+if _name_ == '_main_':
+    
+    # 1. TREINAMENTO (Etapa 3.5)
+    train_and_validate_model(model, criterion, optimizer, num_epochs=NUM_EPOCHS) 
+
+    # 2. CARREGAR O MELHOR MODELO SALVO
+    best_model = model
+    try:
+        best_model.load_state_dict(torch.load('best_luva_classifier.pth'))
+        print("\n[SUCESSO] Melhor modelo salvo foi carregado.")
+    except FileNotFoundError:
+        print("\n[AVISO] Arquivo 'best_luva_classifier.pth' não encontrado.")
+        print("Usando o modelo treinado na última época para avaliação e inferência.")
+    
+    # 3. AVALIAÇÃO DE DESEMPENHO (Etapa 3.6)
+    evaluate_model(best_model, criterion) 
+
+    # 4. PROTÓTIPO (Etapa 3.7) - CHAMADA FINAL
+    TEST_IMAGE_FILENAME = 'luva_teste.jpg' 
+    # Usa o caminho absoluto
+    TEST_IMAGE_PATH = os.path.join(PROJECT_ROOT, TEST_IMAGE_FILENAME)
+    
+    # Verifica se a imagem de teste existe antes de tentar a inferência
+    if os.path.exists(TEST_IMAGE_PATH):
+        run_inference(best_model, TEST_IMAGE_PATH, val_test_transforms)
+    else:
+        print(f"\n[AVISO] O protótipo (Etapa 3.7) não foi executado.")
+        print(f"Não foi possível encontrar a imagem em: {TEST_IMAGE_PATH}")
+        print(f"Verifique se o caminho PROJECT_ROOT no topo do arquivo está correto.")
