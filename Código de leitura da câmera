@@ -4,114 +4,256 @@ from torchvision import transforms, models
 import cv2
 from PIL import Image
 import numpy as np
+import requests
+import time
+import serial # Importação para comunicação serial
+import pyttsx3 # 🌟 IMPORTAÇÃO PARA SÍNTESE DE VOZ
+import threading # 🌟 IMPORTAÇÃO PARA VOZ NÃO-BLOQUEANTE (Solução do ex_Voz_repetida)
 
 # ==============================================================================
-# 1. CONFIGURAÇÕES DO PROJETO (Manter consistente com train_classifier.py)
+# 0. FUNÇÃO DE VOZ NÃO-BLOQUEANTE (USANDO THREADING)
 # ==============================================================================
-MODEL_PATH = 'best_luva_classifier.pth' # Seu modelo treinado
+def speak_non_blocking(texto):
+    """
+    Inicializa o motor de voz em um thread separado. Isso garante que a chamada
+    runAndWait() não bloqueie o loop principal de captura e processamento do vídeo.
+    """
+    def _speak():
+        # A inicialização DENTRO do thread evita problemas de concorrência.
+        engine = pyttsx3.init()
+        engine.setProperty('rate', 150) # Velocidade da fala
+        
+        # Tenta definir uma voz específica (opcional, pode variar por sistema)
+        try:
+            voices = engine.getProperty('voices')
+            if voices:
+                engine.setProperty('voice', voices[0].id) 
+        except Exception:
+            pass # Continua mesmo que falhe ao definir a voz
+            
+        print(f"[FALA] Disparando: {texto}")
+        engine.say(texto)
+        engine.runAndWait() # Bloqueia APENAS este thread secundário
+        
+    # Inicia o thread. 'daemon=True' garante que ele se encerra com o programa principal.
+    threading.Thread(target=_speak, daemon=True).start()
+
+
+# ==============================================================================
+# 1. CONFIGURAÇÕES DO PROJETO, IOT E ARDUINO (AJUSTE AQUI)
+# ==============================================================================
+MODEL_PATH = 'best_luva_classifier.pth' 
 IMAGE_SIZE = 224 
 NUM_CLASSES = 2
 CLASSES = ['com_defeito', 'sem_defeito']
-device = torch.device("cpu") # Usaremos CPU para estabilidade na captura de vídeo
+device = torch.device("cpu")
+CAMERA_INDEX = 1 
 
-# O índice '0' geralmente se refere à webcam padrão
-CAMERA_INDEX = 0
+# CONFIGURAÇÕES ARDUINO 
+SERIAL_PORT = 'COM4' # ⚠️ AJUSTE PARA A PORTA CORRETA.
+SERIAL_BAUD_RATE = 9600
+
+# CONFIGURAÇÕES THINGER.IO 
+THINGER_IO_URL = f"https://backend.thinger.io/v3/users/Ingrid/devices/Inspecao_qualidade_luva/callback/data"  
+THINGER_IO_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkZXYiOiJJbnNwZWNhb19xdWFsaWRhZGVfbHV2YSIsImlhdCI6MTc2MTMzODQyMiwianRpIjoiNjhmYmU0MzYzMGExZDg0YjZiMDRiOTM0Iiwic3ZyIjoidXMtZWFzdC5hd3MudGhpbmdlci5pbyIsInVzciI6IkluZ3JpZCJ9.t5ojYCX5k0m0A5csBHMRbcbaNtwyKbMAQ8Eg-csxVTk"
+SEND_INTERVAL = 60 
+# ==============================================================================
+
 
 # ==============================================================================
-# 2. PRÉ-PROCESSAMENTO (O mesmo pipeline de validação/teste)
+# 2. FUNÇÃO DE ENVIO DE DADOS SERIAL E IOT
+# ==============================================================================
+def send_serial_command(ser_connection, command):
+    """Envia um comando Serial ('V', 'R' ou 'N') para o Arduino."""
+    if not isinstance(ser_connection, serial.Serial):
+        return 
+    try:
+        ser_connection.write(command.encode()) 
+    except serial.SerialException as e:
+        print(f"[ERRO SERIAL] Falha ao enviar comando para Arduino: {e}")
+    except Exception as e:
+          print(f"[ERRO SERIAL DESCONHECIDO] {e}")
+
+
+def send_data_to_thingerio(decision, approved_count, rejected_count):
+    """Envia o status atual da inspeção e as contagens para o Thinger.io."""
+    
+    payload = {
+        "status_luva": decision,
+        "aprovadas": approved_count,
+        "rejeitadas": rejected_count
+    }
+    
+    headers = {
+        'Authorization': f'Bearer {THINGER_IO_TOKEN}',
+        'Content-Type': 'application/json'
+    }
+    
+    try:
+        response = requests.post(THINGER_IO_URL, json=payload, headers=headers)
+        response.raise_for_status() 
+        print(f"[SUCESSO THINGER.IO] Dados enviados. Status: {response.status_code}")
+        
+    except requests.exceptions.RequestException as e:
+        print(f"[ERRO THINGER.IO] Falha ao enviar dados: {e}")
+
+
+# ==============================================================================
+# 3. PRÉ-PROCESSAMENTO e 4. CLASSIFICAR FRAME
 # ==============================================================================
 val_test_transforms = transforms.Compose([
     transforms.Resize(IMAGE_SIZE),
     transforms.CenterCrop(IMAGE_SIZE),
-    transforms.ToTensor(),
+    transforms.ToTensor(),  
     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
 ])
 
-# ==============================================================================
-# 3. FUNÇÃO DE INFERÊNCIA NO QUADRO (Frame)
-# ==============================================================================
 def classify_frame(model, frame, transform):
-    # 1. Converte o frame OpenCV (BGR) para o formato PIL (RGB) para o PyTorch
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(frame_rgb)
-    
-    # 2. Aplica as transformações
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(img_rgb)
     input_tensor = transform(pil_image)
-    
-    # 3. Adiciona uma dimensão para o batch (B, C, H, W) e move para o dispositivo
-    input_batch = input_tensor.unsqueeze(0).to(device)
+    input_batch = input_tensor.unsqueeze(0)
 
     with torch.no_grad():
-        model.eval() # Coloca o modelo em modo de avaliação
-        output = model(input_batch)
-        
-        # 4. Processamento da Saída
-        probabilities = torch.nn.functional.softmax(output[0], dim=0)
-        confidence, predicted_index = torch.max(probabilities, 0)
+        output = model(input_batch.to(device))
 
-        predicted_class = CLASSES[predicted_index.item()]
-        
-        # 5. Lógica de Decisão (Aprovar/Reprovar)
-        # O F1-score e a Acurácia foram altos, então usaremos o índice 1 ('sem_defeito') como aprovação
-        if predicted_class == 'sem_defeito' and confidence.item() > 0.8: # Threshold de 80%
-            decision = "✅ APROVADA"
-            color = (0, 255, 0)  # Verde
-        else:
-            decision = "❌ REPROVADA"
-            color = (0, 0, 255)  # Vermelho
-            
-        return predicted_class, confidence.item(), decision, color
+    probabilities = torch.nn.functional.softmax(output[0], dim=0)
+    confidence, predicted_index = torch.max(probabilities, 0)
+
+    pred_class = CLASSES[predicted_index.item()]
+    confidence_val = confidence.item()
+
+    if pred_class == 'sem_defeito' and confidence_val >= 0.6:
+        decision = "APROVADA"
+        color = (0, 255, 0) # Verde
+    elif pred_class == 'com_defeito' and confidence_val >= 0.6:
+        decision = "REJEITADA"
+        color = (0, 0, 255) # Vermelho
+    else:
+        decision = "INDEFINIDO"
+        color = (255, 255, 0) # Amarelo
+
+    return pred_class, confidence_val, decision, color
+
 
 # ==============================================================================
-# 4. LOOP PRINCIPAL DE VÍDEO
+# 5. FUNÇÃO PRINCIPAL: LOOP DE INSPEÇÃO E CONTROLE
 # ==============================================================================
 def main():
-    print("Iniciando o sistema de inspeção de qualidade em tempo real...")
-    
-    # 1. Carregar Modelo
+    # 1. Carregar o modelo
     model_ft = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
     num_ftrs = model_ft.fc.in_features
     model_ft.fc = nn.Linear(num_ftrs, NUM_CLASSES)
     model_ft.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model_ft = model_ft.to(device)
+    model_ft.to(device)
     model_ft.eval()
-    print(f"Modelo '{MODEL_PATH}' carregado com sucesso.")
 
-    # 2. Iniciar Captura de Vídeo
+    # 2. Iniciar Câmera
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"ERRO: Não foi possível abrir a câmera no índice {CAMERA_INDEX}. Verifique se a câmera está conectada.")
+        print(f"ERRO: Não foi possível abrir a câmera no índice {CAMERA_INDEX}.")
         return
 
-    print("\nIniciando feed da câmera. Pressione 'q' para sair.")
+    # -------------------------------------------------------------
+    # INICIALIZAÇÃO DA CONEXÃO SERIAL
+    # -------------------------------------------------------------
+    arduino_serial = None
+    try:
+        arduino_serial = serial.Serial(SERIAL_PORT, SERIAL_BAUD_RATE, timeout=1)
+        time.sleep(2) 
+        print(f"[SERIAL] Conexão Arduino estabelecida em {SERIAL_PORT}.")
+    except serial.SerialException as e:
+        print(f"[ERRO FATAL SERIAL] Não foi possível conectar ao Arduino em {SERIAL_PORT}: {e}")
+        arduino_serial = None 
+        print("Prosseguindo com inspeção, mas sem controle de LED.")
+    # -------------------------------------------------------------
     
+    # 🌟 O motor de voz será inicializado de forma não-bloqueante na função 'speak_non_blocking'
+    
+    # Inicialização dos Contadores
+    approved_count = 0
+    rejected_count = 0
+    last_send_time = time.time()
+    last_decision = "INICIANDO" 
+
     while True:
-        # 3. Captura o frame
         ret, frame = cap.read()
         if not ret:
-            print("Não foi possível receber o frame. Saindo...")
             break
 
-        # 4. Classifica o frame
         pred_class, confidence, decision, color = classify_frame(model_ft, frame, val_test_transforms)
         
-        # 5. Adiciona o texto de resultado ao frame (OpenCV usa BGR)
+        # Lógica de controle de LED, Contagem e VOZ
+        # 🌟 Só executa se a decisão MUDOU (ou se está saindo de INDEFINIDO)
+        if decision != last_decision:
+            
+            speech_text = ""
+            command = 'N' # Comando padrão neutro
+            
+            # 1. Controle Serial e Definição da Fala
+            if decision == "APROVADA":
+                command = 'V' # 'V' para Verde
+                speech_text = "Luva APROVADA!"
+            elif decision == "REJEITADA":
+                command = 'R' # 'R' para Vermelho
+                speech_text = "Luva REJEITADA!"
+            
+            
+            # 2. Executa o Comando Serial (V, R ou N)
+            if arduino_serial:
+                send_serial_command(arduino_serial, command)
+
+            # 🌟 3. SÍNTESE DE VOZ: CHAMA A FUNÇÃO NÃO-BLOQUEANTE
+            if speech_text:
+                speak_non_blocking(speech_text) 
+                
+            # 4. Lógica de Incremento (Contadores)
+            if decision == "APROVADA":
+                approved_count += 1
+            elif decision == "REJEITADA":
+                rejected_count += 1
+            
+            last_decision = decision # Atualiza a última decisão
+        
+        
+        # LÓGICA DE ENVIO IOT A CADA 60 SEGUNDOS
+        current_time = time.time()
+        if current_time - last_send_time >= SEND_INTERVAL:
+            # Envia a última decisão clara e as contagens
+            send_data_to_thingerio(last_decision, approved_count, rejected_count)
+            last_send_time = current_time 
+
+        # Exibição no Frame
         text_prediction = f"Classe: {pred_class.upper()} (Conf: {confidence:.2f})"
         text_decision = f"DECISAO: {decision}"
         
         cv2.putText(frame, text_prediction, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, text_decision, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3, cv2.LINE_AA)
-        
-        # 6. Exibe o frame
-        cv2.imshow('Inspeção de Qualidade em Tempo Real', frame)
+        cv2.putText(frame, text_decision, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2, cv2.LINE_AA)
 
-        # 7. Sai do loop se a tecla 'q' for pressionada
+        time_remaining = SEND_INTERVAL - int(current_time - last_send_time)
+        text_counts = f"Aprovadas: {approved_count} | Rejeitadas: {rejected_count} | IOT em: {time_remaining}s"
+        cv2.putText(frame, text_counts, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+        
+        cv2.imshow('Inspeção em Tempo Real', frame)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-    # 8. Limpeza
+    # FECHAMENTO DA CONEXÃO SERIAL
+    if arduino_serial and arduino_serial.is_open:
+        send_serial_command(arduino_serial, 'N') 
+        arduino_serial.close()
+        print("[SERIAL] Conexão Arduino encerrada.")
+
     cap.release()
     cv2.destroyAllWindows()
+    print("\nFeed da câmera encerrado.")
 
-if _name_ == '_main_':
+if __name__ == '__main__':
+    try:
+        import serial
+    except ImportError:
+        print("Módulo 'pyserial' não encontrado. Instale com: pip install pyserial")
+        exit()
+        
     main()
