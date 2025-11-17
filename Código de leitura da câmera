@@ -6,36 +6,33 @@ from PIL import Image
 import numpy as np
 import requests
 import time
-import serial # Importação para comunicação serial
-import pyttsx3 # 🌟 IMPORTAÇÃO PARA SÍNTESE DE VOZ
-import threading # 🌟 IMPORTAÇÃO PARA VOZ NÃO-BLOQUEANTE (Solução do ex_Voz_repetida)
+import serial 
+import pyttsx3 
+import threading 
 
 # ==============================================================================
-# 0. FUNÇÃO DE VOZ NÃO-BLOQUEANTE (USANDO THREADING)
+# 0. FUNÇÃO DE VOZ NÃO-BLOQUEANTE (COM VOLUME MÁXIMO)
 # ==============================================================================
 def speak_non_blocking(texto):
     """
-    Inicializa o motor de voz em um thread separado. Isso garante que a chamada
-    runAndWait() não bloqueie o loop principal de captura e processamento do vídeo.
+    Inicializa o motor de voz em um thread separado, com o volume no máximo (1.0).
     """
     def _speak():
-        # A inicialização DENTRO do thread evita problemas de concorrência.
         engine = pyttsx3.init()
         engine.setProperty('rate', 150) # Velocidade da fala
+        engine.setProperty('volume', 1.0) # 🌟 AUMENTA O VOLUME PARA O MÁXIMO
         
-        # Tenta definir uma voz específica (opcional, pode variar por sistema)
         try:
             voices = engine.getProperty('voices')
             if voices:
                 engine.setProperty('voice', voices[0].id) 
         except Exception:
-            pass # Continua mesmo que falhe ao definir a voz
+            pass
             
         print(f"[FALA] Disparando: {texto}")
         engine.say(texto)
-        engine.runAndWait() # Bloqueia APENAS este thread secundário
+        engine.runAndWait() 
         
-    # Inicia o thread. 'daemon=True' garante que ele se encerra com o programa principal.
     threading.Thread(target=_speak, daemon=True).start()
 
 
@@ -168,8 +165,6 @@ def main():
         print("Prosseguindo com inspeção, mas sem controle de LED.")
     # -------------------------------------------------------------
     
-    # 🌟 O motor de voz será inicializado de forma não-bloqueante na função 'speak_non_blocking'
-    
     # Inicialização dos Contadores
     approved_count = 0
     rejected_count = 0
@@ -177,14 +172,28 @@ def main():
     last_decision = "INICIANDO" 
 
     while True:
+        # ----------------- MEDIÇÃO DE INFERÊNCIA --------------------
+        start_time_loop = time.time() # 🌟 Começa a contagem
+        # ------------------------------------------------------------
+        
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Captura do frame, pré-processamento e inferência
         pred_class, confidence, decision, color = classify_frame(model_ft, frame, val_test_transforms)
         
+        # ------------------------------------------------------------
+        end_time_loop = time.time() # 🌟 Termina a contagem
+        
+        # Calcula o tempo de inferência em milissegundos
+        inference_time_ms = (end_time_loop - start_time_loop) * 1000
+        # Calcula o FPS (Frames per Second)
+        # O FPS é mais baixo do que a taxa de frames da câmera, pois inclui o tempo de inferência.
+        fps = 1 / (end_time_loop - start_time_loop) 
+        # ------------------------------------------------------------
+        
         # Lógica de controle de LED, Contagem e VOZ
-        # 🌟 Só executa se a decisão MUDOU (ou se está saindo de INDEFINIDO)
         if decision != last_decision:
             
             speech_text = ""
@@ -198,12 +207,11 @@ def main():
                 command = 'R' # 'R' para Vermelho
                 speech_text = "Luva REJEITADA!"
             
-            
             # 2. Executa o Comando Serial (V, R ou N)
             if arduino_serial:
                 send_serial_command(arduino_serial, command)
 
-            # 🌟 3. SÍNTESE DE VOZ: CHAMA A FUNÇÃO NÃO-BLOQUEANTE
+            # 3. SÍNTESE DE VOZ: CHAMA A FUNÇÃO NÃO-BLOQUEANTE
             if speech_text:
                 speak_non_blocking(speech_text) 
                 
@@ -233,6 +241,10 @@ def main():
         time_remaining = SEND_INTERVAL - int(current_time - last_send_time)
         text_counts = f"Aprovadas: {approved_count} | Rejeitadas: {rejected_count} | IOT em: {time_remaining}s"
         cv2.putText(frame, text_counts, (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2, cv2.LINE_AA)
+        
+        # 🌟 NOVO: EXIBIÇÃO DO TEMPO DE INFERÊNCIA E FPS
+        text_timing = f"Tempo Infer: {inference_time_ms:.2f} ms | FPS: {fps:.1f}"
+        cv2.putText(frame, text_timing, (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 165, 0), 2, cv2.LINE_AA) # Laranja
         
         cv2.imshow('Inspeção em Tempo Real', frame)
 
