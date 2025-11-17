@@ -11,6 +11,10 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 import time
 from PIL import Image 
 
+# 🌟 NOVOS IMPORTS NECESSÁRIOS PARA GERAR O GRÁFICO 🌟
+import matplotlib.pyplot as plt
+import seaborn as sns 
+
 # ==============================================================================
 # 1. PRÉ-PROCESSAMENTO DOS DADOS (Etapa 3.3)
 # ==============================================================================
@@ -22,7 +26,7 @@ DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 NUM_CLASSES = 2 
 IMAGE_SIZE = 224 # Tamanho esperado pela ResNet
 BATCH_SIZE = 8
-NUM_EPOCHS = 3 # Reduzido para testar o pipeline rapidamente
+NUM_EPOCHS = 20 # Reduzido para testar o pipeline rapidamente
 LEARNING_RATE = 0.001
 
 # Configuração do dispositivo (GPU ou CPU)
@@ -53,7 +57,7 @@ val_test_transforms = transforms.Compose([
 try:
     image_datasets = {
         x: datasets.ImageFolder(os.path.join(DATA_DIR, x), 
-                                train_transforms if x == 'train' else val_test_transforms)
+                                 train_transforms if x == 'train' else val_test_transforms)
         for x in ['train', 'val', 'test']
     }
 
@@ -72,7 +76,36 @@ except Exception as e:
     exit()
 
 # ==============================================================================
-# 2. DESENVOLVIMENTO DO MODELO (Etapa 3.4 - Transferência de Aprendizado)
+# 2. MÓDULO DE PLOTAGEM DA MATRIZ DE CONFUSÃO (NOVA FUNÇÃO)
+# ==============================================================================
+
+def plot_confusion_matrix(cm, class_names):
+    """
+    Função para plotar a Matriz de Confusão como um mapa de calor.
+    cm: Matriz de Confusão (array numpy)
+    class_names: Lista de nomes das classes (ex: ['com_defeito', 'sem_defeito'])
+    """
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        cm, 
+        annot=True,              # Mostrar os números em cada célula
+        fmt='d',                 # Formato para números inteiros (contagens)
+        cmap='Blues',            # Esquema de cores
+        xticklabels=class_names, # Rótulos do eixo X (Previsto)
+        yticklabels=class_names, # Rótulos do eixo Y (Verdadeiro)
+        cbar=True                # Mostrar barra de cores
+    )
+    plt.title('Matriz de Confusão do Modelo (Conjunto de Teste)')
+    plt.ylabel('Rótulo Verdadeiro')
+    plt.xlabel('Rótulo Previsto')
+    
+    # Salva o gráfico como imagem para o artigo
+    plt.savefig('confusion_matrix_heatmap.png') 
+    plt.show() # Exibe o gráfico
+
+
+# ==============================================================================
+# 3. DESENVOLVIMENTO DO MODELO (Etapa 3.4 - Transferência de Aprendizado)
 # ==============================================================================
 
 def setup_model():
@@ -99,7 +132,7 @@ model, criterion, optimizer = setup_model()
 
 
 # ==============================================================================
-# 3. TREINAMENTO E VALIDAÇÃO (Etapa 3.5)
+# 4. TREINAMENTO E VALIDAÇÃO (Etapa 3.5)
 # ==============================================================================
 
 def train_and_validate_model(model, criterion, optimizer, num_epochs):
@@ -157,12 +190,12 @@ def train_and_validate_model(model, criterion, optimizer, num_epochs):
     return model
 
 # ==============================================================================
-# 4. AVALIAÇÃO DE DESEMPENHO (Etapa 3.6)
+# 5. AVALIAÇÃO DE DESEMPENHO (Etapa 3.6) - COM PLOTAGEM DA MATRIZ
 # ==============================================================================
 
 def evaluate_model(model, criterion):
     """
-    Calcula as métricas de desempenho no conjunto de TESTE.
+    Calcula as métricas de desempenho no conjunto de TESTE e PLOTA a Matriz de Confusão.
     """
     model.eval()
     y_true = []
@@ -202,16 +235,15 @@ def evaluate_model(model, criterion):
     print(f'Precisão: {precision:.4f}')
     print(f'Revocação (Recall): {recall:.4f}')
     print(f'F1-Score: {f1:.4f}')
-    print('\nMatriz de Confusão (True vs Predição):')
-    print(f"[ [Verdadeiro Negativo, Falso Positivo],")
-    print(f"  [Falso Negativo, Verdadeiro Positivo] ]")
+    print('\nMatriz de Confusão (True vs Predição) - Formato Numérico:')
     print(conf_matrix)
     print('='*50)
-
-    return model
+    
+    # 🌟 CHAMADA PARA GERAR O GRÁFICO (MAPA DE CALOR) 🌟
+    plot_confusion_matrix(conf_matrix, class_names)
 
 # ==============================================================================
-# 5. IMPLEMENTAÇÃO DO PROTÓTIPO (Etapa 3.7) - FUNÇÃO
+# 6. IMPLEMENTAÇÃO DO PROTÓTIPO (Etapa 3.7) - FUNÇÃO
 # ==============================================================================
 
 def run_inference(model, image_path, transform):
@@ -259,9 +291,9 @@ def run_inference(model, image_path, transform):
 
 
 # ==============================================================================
-# 6. EXECUÇÃO PRINCIPAL DO PIPELINE (Fluxo de Controle)
+# 7. EXECUÇÃO PRINCIPAL DO PIPELINE (Fluxo de Controle)
 # ==============================================================================
-if _name_ == '_main_':
+if __name__ == '__main__':
     
     # 1. TREINAMENTO (Etapa 3.5)
     train_and_validate_model(model, criterion, optimizer, num_epochs=NUM_EPOCHS) 
